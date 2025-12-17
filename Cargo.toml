@@ -1,0 +1,12 @@
+[package]
+name = "tjs2dec"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+byteorder = "1"
+memchr = "2"
