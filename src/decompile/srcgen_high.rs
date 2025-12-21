@@ -56,204 +56,6 @@ fn vm_unop(op: &str) -> Option<UnOp> {
     }
 }
 
-// precedence-aware printing (no helper in output)
-// fn pp_expr(e: &Expr, fmt_var: &dyn Fn(VarId) -> String, parent_prec: i32) -> String {
-//     match e {
-//         Expr::SsaVar(v) => fmt_var(*v),
-//         Expr::Reg(r) => format!("r{}", r),
-//         Expr::Flag => "__flag".to_string(),
-//         Expr::Void => "void".to_string(),
-//         Expr::Null => "null".to_string(),
-//         Expr::Bool(b) => if *b { "true".into() } else { "false".into() },
-//         Expr::Int(i) => i.to_string(),
-//         Expr::Real(f) => {
-//             if f.is_finite() { f.to_string() } else { "NaN".into() }
-//         }
-//         Expr::Str(s) => format!("{:?}", s),
-//         Expr::Octet(_) => "/*octet*/".into(),
-
-//         Expr::Unary(op, inner) => {
-//             let inner_s = pp_expr(inner, fmt_var, 100);
-//             let s = if op.needs_space() {
-//                 format!("{} {}", op.op_str(), inner_s)
-//             } else {
-//                 format!("{}{}", op.op_str(), inner_s)
-//             };
-//             if 100 < parent_prec { format!("({})", s) } else { s }
-//         }
-
-//         Expr::Binary(op, a, b) => {
-//             let my = op.precedence() as i32;
-//             let la = pp_expr(a, fmt_var, my.into());
-//             let rb_prec = if op.tightens_right() { my + 1 } else { my };
-//             let rb = pp_expr(b, fmt_var, rb_prec.into());
-
-//             let s = format!("{} {} {}", la, op.op_str(), rb);
-//             if my < parent_prec { format!("({})", s) } else { s }
-//         }
-
-//         Expr::Call(f, args) => {
-//             let mut s = String::new();
-//             s.push_str(&pp_expr(f, fmt_var, 100));
-//             s.push('(');
-//             for (i, a) in args.iter().enumerate() {
-//                 if i != 0 { s.push_str(", "); }
-//                 s.push_str(&pp_expr(a, fmt_var, 0));
-//             }
-//             s.push(')');
-//             s
-//         }
-
-//         Expr::New(f, args) => {
-//             let mut s = String::new();
-//             s.push_str("new ");
-//             s.push_str(&pp_expr(f, fmt_var, 100));
-//             s.push('(');
-//             for (i, a) in args.iter().enumerate() {
-//                 if i != 0 { s.push_str(", "); }
-//                 s.push_str(&pp_expr(a, fmt_var, 0));
-//             }
-//             s.push(')');
-//             s
-//         }
-
-//         Expr::Index(a, i) => format!("{}[{}]", pp_expr(a, fmt_var, 100), pp_expr(i, fmt_var, 0)),
-//         Expr::Member(base, name) => format!("{}.{}", pp_expr(base, fmt_var, 100), name),
-//         Expr::MethodCall { base, member, args } => {
-//             let mut s = format!("{}.{}(", pp_expr(base, fmt_var, 100), member);
-//             for (i, a) in args.iter().enumerate() {
-//                 if i != 0 { s.push_str(", "); }
-//                 s.push_str(&pp_expr(a, fmt_var, 0));
-//             }
-//             s.push(')');
-//             s
-//         }
-
-//         Expr::Opaque(op, args) => {
-//             if args.len() == 2 {
-//                 if let Some(bop) = vm_binop(op) {
-//                     let my = bop.precedence() as i32;
-//                     let la = pp_expr(&args[0], fmt_var, my);
-//                     let rb_prec = if bop.tightens_right() { my + 1 } else { my };
-//                     let rb = pp_expr(&args[1], fmt_var, rb_prec);
-//                     let s = format!("{} {} {}", la, bop.op_str(), rb);
-//                     return if my < parent_prec { format!("({})", s) } else { s };
-//                 }
-//             }
-//             if args.len() == 1 {
-//                 if let Some(uop) = vm_unop(op) {
-//                     let inner = pp_expr(&args[0], fmt_var, 100);
-//                     let s = if uop.needs_space() {
-//                         format!("{} {}", uop.op_str(), inner)
-//                     } else {
-//                         format!("{}{}", uop.op_str(), inner)
-//                     };
-//                     return if 100 < parent_prec { format!("({})", s) } else { s };
-//                 }
-//             }
-
-//             // fallback: keep it as call-like text (still static, no helper)
-//             let mut s = String::new();
-//             s.push_str(op);
-//             s.push('(');
-//             for (i, a) in args.iter().enumerate() {
-//                 if i != 0 { s.push_str(", "); }
-//                 s.push_str(&pp_expr(a, fmt_var, 0));
-//             }
-//             s.push(')');
-//             s
-//         }
-
-//         Expr::ConstData(idx) => return fmt_const_data(*idx, file),
-//         Expr::Deref(a) => format!("*{}", pp_expr(a, fmt_var, 100)),
-//     }
-// }
-
-
-// fn fmt_const_data(idx: usize, file: &Tjs2File) -> String {
-//     let v: &Variant = match file.const_pools_data_get(idx) {
-//         Some(v) => v,
-//         None => return "void".to_string(),
-//     };
-
-//     match v {
-//         Variant::Void => "void".to_string(),
-//         Variant::NullObject => "null".to_string(),
-
-//         Variant::Byte(i) => file
-//             .const_pools
-//             .bytes
-//             .get(*i as usize)
-//             .map(|x| (*x as i64).to_string())
-//             .unwrap_or_else(|| "void".to_string()),
-
-//         Variant::Short(i) => file
-//             .const_pools
-//             .shorts
-//             .get(*i as usize)
-//             .map(|x| (*x as i64).to_string())
-//             .unwrap_or_else(|| "void".to_string()),
-
-//         Variant::Integer(i) => file
-//             .const_pools
-//             .ints
-//             .get(*i as usize)
-//             .map(|x| (*x as i64).to_string())
-//             .unwrap_or_else(|| "void".to_string()),
-
-//         Variant::Long(i) => file
-//             .const_pools
-//             .longs
-//             .get(*i as usize)
-//             .map(|x| x.to_string())
-//             .unwrap_or_else(|| "void".to_string()),
-
-//         Variant::Real(i) => {
-//             let f = file
-//                 .const_pools
-//                 .doubles
-//                 .get(*i as usize)
-//                 .copied()
-//                 .unwrap_or(f64::NAN);
-//             if f.is_finite() {
-//                 // keep default formatting; adjust if you want fixed precision
-//                 f.to_string()
-//             } else {
-//                 "NaN".to_string()
-//             }
-//         }
-
-//         Variant::String(i) => {
-//             let s = file
-//                 .const_pools
-//                 .strings
-//                 .get(*i as usize)
-//                 .cloned()
-//                 .unwrap_or_else(|| "<bad-string-index>".to_string());
-//             format!("\"{}\"", escape_tjs_string_min(&s))
-//         }
-
-//         Variant::Octet(i) => {
-//             let bytes = file
-//                 .const_pools
-//                 .octets
-//                 .get(*i as usize)
-//                 .map(|v| v.as_slice())
-//                 .unwrap_or(&[]);
-//             fmt_octet_literal(bytes)
-//         }
-
-//         Variant::InterObject(oi) => file
-//             .objects
-//             .get(*oi as usize)
-//             .and_then(|o| o.name.clone())
-//             .unwrap_or_else(|| format!("__obj_{}", oi)),
-
-//         Variant::InterGenerator(gi) => format!("__gen_{}", gi),
-
-//         Variant::Unknown => "void".to_string(),
-//     }
-// }
 
 fn fmt_octet_literal(bytes: &[u8]) -> String {
     // B: official usage style
@@ -1441,7 +1243,7 @@ fn infer_arg_regs(prog: &ExprProgram) -> Vec<i32> {
     let mut neg_regs: Vec<i32> = vars
         .iter()
         .filter_map(|v| match v.var {
-            Var::Reg(r) if r < 0 => Some(r),
+            Var::Reg(r) if r <= -3 => Some(r),
             _ => None,
         })
         .collect();
@@ -1470,7 +1272,7 @@ fn infer_arg_regs(prog: &ExprProgram) -> Vec<i32> {
 fn arg_name_for_reg(r: i32) -> String {
     // r-3 -> a0, r-4 -> a1 ...
     let idx = (-3 - r) as usize;
-    format!("a{}", idx)
+    format!("a{}_1", idx)
 }
 
 fn emit_var_decls(
@@ -1609,7 +1411,14 @@ fn var_key(v: &VarId) -> (u8, i32) {
 
 fn fmt_vid_tjs(vid: VarId) -> String {
     match vid.var {
-        Var::Reg(r) => format!("r{}_{}", r, vid.ver),
+        Var::Reg(r) => {
+            // format!("r{}_{}", r, vid.ver)
+            if r >= 0 {
+                format!("r{}_{}", r, vid.ver)
+            } else {
+                format!("a{}_{}", -3 - r, vid.ver)
+            }
+        },
         Var::Flag => format!("flag_{}", vid.ver),
         Var::Exception => format!("exc_{}", vid.ver),
     }
