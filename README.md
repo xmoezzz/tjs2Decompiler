@@ -1,9 +1,3 @@
 # tjs2dec
 
-Experimental TJS2 bytecode tooling for Kirikiri.
-
-## Build
-
-```bash
-cargo build --release
-```
+A minimal, strict TJS2 (Kirikiri2 / krkrz) bytecode loader + disassembler written in Rust.

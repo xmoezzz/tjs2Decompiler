@@ -1,12 +1,9 @@
 [package]
 name = "tjs2dec"
 version = "0.1.0"
-edition = "2021"
-license = "MIT"
+edition = "2024"
+license = "MPL-2.0"
 
 [dependencies]
 anyhow = "1"
-thiserror = "2"
 clap = { version = "4", features = ["derive"] }
-byteorder = "1"
-memchr = "2"
