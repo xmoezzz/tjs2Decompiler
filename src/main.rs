@@ -1,14 +1,20 @@
-use std::fs;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::fs;
 
 use tjs2dec::{
-    decompile::{dump_hlir_file, dump_ssa_file}, disasm::disassemble_file, emit_executable_tjs, load_tjs2_bytecode
+    decompile::srcgen_high::dump_src_file as dump_src_file_high,
+    decompile::{dump_hlir_file, dump_ssa_file},
+    disasm::disassemble_file,
+    emit_executable_tjs, load_tjs2_bytecode,
 };
 
 #[derive(Parser)]
-#[command(name = "tjs2dec", version, about = "TJS2 (krkrz) bytecode loader + disassembler")]
+#[command(
+    name = "tjs2dec",
+    version,
+    about = "TJS2 (krkrz) bytecode loader + disassembler"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -35,6 +41,10 @@ enum Command {
         #[arg(long)]
         hlir: bool,
     },
+    Tjs {
+        /// Path to a compiled script file (e.g., Action.tjs)
+        path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -60,6 +70,12 @@ fn main() -> Result<()> {
             } else {
                 dump_ssa_file(&file).context("build SSA")?
             };
+            print!("{}", text);
+        }
+        Command::Tjs { path } => {
+            let buf = fs::read(&path).with_context(|| format!("read {}", path))?;
+            let file = load_tjs2_bytecode(&buf).context("parse structured TJS2 bytecode")?;
+            let text = dump_src_file_high(&file, Default::default()).context("build src")?;
             print!("{}", text);
         }
     }

@@ -461,13 +461,14 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
     };
 
     // Opcodes that define/consume the flag.
-    if matches!(op, vm::VM_CEQ | vm::VM_CDEQ | vm::VM_CLT | vm::VM_CGT | vm::VM_TT | vm::VM_TF | vm::VM_SETF | vm::VM_SETNF | vm::VM_NF) {
+    // Note: SETF/SETNF are constant-set-to-register, not flag operations.
+    if matches!(op, vm::VM_CEQ | vm::VM_CDEQ | vm::VM_CLT | vm::VM_CGT | vm::VM_CHKINS | vm::VM_TT | vm::VM_TF | vm::VM_NF){
         let mut uses = Vec::new();
         match op {
             x if x == vm::VM_TT || x == vm::VM_TF => {
                 uses.push(r(0));
             }
-            x if x == vm::VM_CEQ || x == vm::VM_CDEQ || x == vm::VM_CLT || x == vm::VM_CGT => {
+            x if x == vm::VM_CEQ || x == vm::VM_CDEQ || x == vm::VM_CLT || x == vm::VM_CGT || x == vm::VM_CHKINS => {
                 uses.push(r(0));
                 uses.push(r(1));
             }
@@ -483,6 +484,12 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
     // Branch uses flag.
     if op == vm::VM_JF || op == vm::VM_JNF {
         return (Vec::new(), vec![Var::Flag]);
+    }
+
+    // SETF/SETNF: dst := true/false (does NOT define Flag)
+    if op == vm::VM_SETF || op == vm::VM_SETNF {
+        let dst = ops.get(0).copied().unwrap_or(0);
+        return (vec![Var::Reg(dst)], Vec::new());
     }
 
     // CONST: dst := data[*]
@@ -578,17 +585,21 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
     }
 
     // DELD/DELI, TYPEOFD/TYPEOFI: affect object + key + dst (for typeof*)
+    // DELD: dst := delete obj[member_data]
     if op == vm::VM_DELD {
-        let obj = ops.get(0).copied().unwrap_or(0);
-        let base = ops.get(1).copied().unwrap_or(0);
-        return (Vec::new(), vec![Var::Reg(obj), Var::Reg(base)]);
+        let dst = ops.get(0).copied().unwrap_or(0);
+        let obj = ops.get(1).copied().unwrap_or(0);
+        return (vec![Var::Reg(dst)], vec![Var::Reg(obj)]);
     }
+
+    // DELI: dst := delete obj[key_reg]
     if op == vm::VM_DELI {
-        let obj = ops.get(0).copied().unwrap_or(0);
-        let base = ops.get(1).copied().unwrap_or(0);
+        let dst = ops.get(0).copied().unwrap_or(0);
+        let obj = ops.get(1).copied().unwrap_or(0);
         let key = ops.get(2).copied().unwrap_or(0);
-        return (Vec::new(), vec![Var::Reg(obj), Var::Reg(base), Var::Reg(key)]);
+        return (vec![Var::Reg(dst)], vec![Var::Reg(obj), Var::Reg(key)]);
     }
+
     if op == vm::VM_TYPEOFD {
         let dst = ops.get(0).copied().unwrap_or(0);
         let base = ops.get(1).copied().unwrap_or(0);
@@ -626,21 +637,27 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
     if op == vm::VM_CALLD {
         let dst = ops.get(0).copied().unwrap_or(0);
         let obj = ops.get(1).copied().unwrap_or(0);
-        let callee = ops.get(3).copied().unwrap_or(0);
+        let tmp = ops.get(3).copied().unwrap_or(0); // tmp func reg
         let argc = ops.get(4).copied().unwrap_or(0);
-        let mut uses = vec![Var::Reg(obj), Var::Reg(callee)];
+        let mut defs = Vec::new();
+        if dst != 0 { defs.push(Var::Reg(dst)); }
+        if tmp != 0 { defs.push(Var::Reg(tmp)); }
+        let mut uses = vec![Var::Reg(obj)];
         uses.extend(call_arg_regs(argc, ops, 5));
-        return (def_r0(dst), uses);
+        return (defs, uses);
     }
     if op == vm::VM_CALLI {
         let dst = ops.get(0).copied().unwrap_or(0);
         let obj = ops.get(1).copied().unwrap_or(0);
         let member = ops.get(2).copied().unwrap_or(0);
-        let callee = ops.get(3).copied().unwrap_or(0);
+        let tmp = ops.get(3).copied().unwrap_or(0); // tmp func reg
         let argc = ops.get(4).copied().unwrap_or(0);
-        let mut uses = vec![Var::Reg(obj), Var::Reg(member), Var::Reg(callee)];
+        let mut defs = Vec::new();
+        if dst != 0 { defs.push(Var::Reg(dst)); }
+        if tmp != 0 { defs.push(Var::Reg(tmp)); }
+        let mut uses = vec![Var::Reg(obj), Var::Reg(member)];
         uses.extend(call_arg_regs(argc, ops, 5));
-        return (def_r0(dst), uses);
+        return (defs, uses);
     }
 
     // Unary RMW operations (conservative default): op %r => r := f(r)

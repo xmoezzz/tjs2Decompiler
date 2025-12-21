@@ -2,6 +2,11 @@ pub mod cfg;
 pub mod decode;
 pub mod hlir;
 pub mod ssa;
+pub mod expr;
+pub mod srcgen_low;
+pub mod srcgen_high;
+pub mod expr_build;
+
 
 use anyhow::Result;
 
@@ -45,6 +50,30 @@ pub fn dump_hlir_file(file: &Tjs2File) -> Result<String> {
         let ssa = ssa::SsaProgram::from_cfg(&cfg)?;
         let hlir = hlir::HlirProgram::from_ssa(&ssa)?;
         out.push_str(&hlir.dump());
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+pub fn dump_expr_file(file: &Tjs2File) -> Result<String> {
+    let mut out = String::new();
+    out.push_str(&format!("toplevel: {}\n", file.toplevel));
+    out.push_str(&format!("objects: {}\n\n", file.objects.len()));
+
+    for obj in &file.objects {
+        out.push_str(&format!(
+            "== object {}: {} ==\n",
+            obj.index,
+            obj.name.as_deref().unwrap_or("<anonymous>")
+        ));
+        if obj.code.is_empty() {
+            out.push_str("  (empty code area; skipped)\n\n");
+            continue;
+        }
+        let cfg = cfg::Cfg::build(obj)?;
+        let ssa = ssa::SsaProgram::from_cfg(&cfg)?;
+        let ep = expr_build::ExprProgram::from_ssa(file, obj, &ssa)?;
+        out.push_str(&ep.dump());
         out.push('\n');
     }
     Ok(out)
