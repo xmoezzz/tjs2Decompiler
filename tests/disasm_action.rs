@@ -92,6 +92,6 @@ fn decompile_tjs_action_tjs_if_present() {
     let buf = std::fs::read(p).expect("read testcase/Action.tjs");
     let file = load_tjs2_bytecode(&buf).expect("parse structured TJS2 bytecode");
 
-    let expr = dump_src_file_high(&file, default::Default::default()).expect("build src");
+    let expr = dump_src_file_high(&file).expect("build src");
     println!("{}", expr);
 }

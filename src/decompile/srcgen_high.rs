@@ -162,6 +162,92 @@ fn split_class_method(name: &str) -> Option<(&str, &str)> {
 //     Ok(out)
 // }
 
+fn const_propagate_intrablock(prog: &mut ExprProgram) {
+    for b in &mut prog.blocks {
+        let mut env: HashMap<VarId, Expr> = HashMap::new();
+
+        for st in &mut b.stmts {
+            // 1) rewrite uses in this statement
+            rewrite_stmt(st, &env);
+
+            // 2) record defs if RHS is safe to propagate
+            match st {
+                Stmt::Assign { dst, expr } => {
+                    if let Some(v) = prop_value(expr, &env) {
+                        env.insert(*dst, v);
+                    }
+                }
+                // Opaque: only propagate if you have explicit “pure” ones (optional)
+                Stmt::Opaque { defs, op, args } => {
+                    // keep simple: do not record (safe default)
+                    let _ = (defs, op, args);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn rewrite_stmt(st: &mut Stmt, env: &HashMap<VarId, Expr>) {
+    match st {
+        Stmt::Assign { expr, .. } => rewrite_expr(expr, env),
+        Stmt::Opaque { args, .. } => {
+            for a in args { rewrite_expr(a, env); }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_expr(e: &mut Expr, env: &HashMap<VarId, Expr>) {
+    match e {
+        Expr::SsaVar(v) => {
+            if let Some(rep) = env.get(v).cloned() {
+                *e = rep;
+            }
+        }
+        Expr::Unary(_, expr) => rewrite_expr(expr, env),
+        Expr::Binary(_, lhs, rhs) => { rewrite_expr(lhs, env); rewrite_expr(rhs, env); }
+        Expr::Member(base, _) => rewrite_expr(base, env),
+        Expr::Index(base, index) => { rewrite_expr(base, env); rewrite_expr(index, env); }
+        Expr::Call(callee, args) => {
+            rewrite_expr(callee, env);
+            for a in args { rewrite_expr(a, env); }
+        }
+        Expr::New(ctor, args) => {
+            rewrite_expr(ctor, env);
+            for a in args { rewrite_expr(a, env); }
+        }
+        _ => {}
+    }
+}
+
+/// Decide whether `rhs` is safe to propagate as a value.
+/// Keep it conservative: literals, variable aliases, and global/thisproxy member refs.
+fn prop_value(rhs: &Expr, env: &HashMap<VarId, Expr>) -> Option<Expr> {
+    let mut v = rhs.clone();
+    rewrite_expr(&mut v, env);
+
+    match &v {
+        // literals
+        Expr::Void | Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Real(_) | Expr::Str(_) | Expr::Octet(_) => Some(v),
+
+        // alias
+        Expr::SsaVar(_) => Some(v),
+
+        // member ref: allow base to be global/thisproxy/this or an already-propagated alias
+        Expr::Member(base, name) => {
+            let ok = matches!(
+                **base,
+                Expr::SsaVar(VarId { var: Var::Reg(-2), .. }) 
+                    | Expr::SsaVar(VarId { var: Var::Reg(-1), .. }) // this
+            ) || is_identifier(name);
+            if ok { Some(v) } else { None }
+        }
+
+        _ => None,
+    }
+}
+
 fn emit_object_body(obj: &Tjs2Object, file: &Tjs2File, indent: usize) -> Result<(String, String)> {
     // let lhs = obj_lhs(obj.index, obj.name.as_deref());
     // writeln!(out, "{} = function() {{", lhs)?;
@@ -169,7 +255,8 @@ fn emit_object_body(obj: &Tjs2Object, file: &Tjs2File, indent: usize) -> Result<
 
     let cfg = Cfg::build(obj)?;
     let ssa = SsaProgram::from_cfg(&cfg)?;
-    let prog = ExprProgram::from_ssa(file, obj, &ssa)?;
+    let mut prog = ExprProgram::from_ssa(file, obj, &ssa)?;
+    const_propagate_intrablock(&mut prog);
     let arg_regs = infer_arg_regs(&prog); 
     let params = arg_regs.iter().map(|&r| arg_name_for_reg(r)).collect::<Vec<_>>().join(", ");
 
@@ -195,89 +282,203 @@ fn emit_object_body(obj: &Tjs2Object, file: &Tjs2File, indent: usize) -> Result<
     for l in lines {
         writeln!(out, "{}", l)?;
     }
-    writeln!(out, "}};\n")?;
+    // writeln!(out, "}};\n")?;
     Ok((out, params))
 }
 
+fn find_class_object<'a>(file: &'a Tjs2File, cls: &str) -> Option<&'a Tjs2Object> {
+    file.objects.iter().find(|o| o.name.as_deref() == Some(cls))
+}
 
-pub fn dump_src_file(file: &Tjs2File, _opt: SrcgenOptions) -> Result<String> {
-    let mut out = String::new();
-    writeln!(out, "// ---- TJS2 Decompiled Source ----")?;
+fn infer_single_return_expr(file: &Tjs2File, getter_obj: &Tjs2Object) -> Option<String> {
+    let cfg = Cfg::build(getter_obj).ok()?;
+    let ssa = SsaProgram::from_cfg(&cfg).ok()?;
+    let prog = ExprProgram::from_ssa(file, getter_obj, &ssa).ok()?;
 
-    // 1) build class_methods: cls -> [object]
-    let mut class_methods: BTreeMap<String, Vec<&Tjs2Object>> = BTreeMap::new();
-    let mut in_class: HashSet<usize> = HashSet::new();
-
-    for obj in &file.objects {
-        if obj.code.is_empty() {
-            continue;
+    let fmt_var = |vid: VarId| -> String {
+        match vid.var {
+            Var::Reg(r) if r <= -3 => format!("a{}", (-3 - r) as i32),
+            Var::Reg(-2) => "global".to_string(),
+            Var::Reg(-1) => "this".to_string(),
+            _ => fmt_vid_tjs(vid),
         }
-        let Some(name) = obj.name.as_deref() else {
-            continue;
-        };
+    };
 
-        // only accept "Class.method" (single dot). If more dots exist, don't treat as class method.
-        let Some((cls, mname)) = name.split_once('.') else {
-            continue;
-        };
-        if cls.is_empty() || mname.is_empty() {
-            continue;
+    let mut ret: Option<Expr> = None;
+    for b in &ssa.blocks {
+        if let Some(last) = b.insns.last() {
+            if last.mnemonic.eq_ignore_ascii_case("RET") || last.mnemonic.eq_ignore_ascii_case("VM_RET") {
+                if let Some(v) = last.uses.get(0).copied() {
+                    let e = Expr::SsaVar(v);
+                    if let Some(prev) = &ret {
+                        if prev.to_tjs_with(&fmt_var) != e.to_tjs_with(&fmt_var) {
+                            return None;
+                        }
+                    }
+                    ret = Some(e);
+                }
+            }
         }
-        if mname.contains('.') {
-            continue;
-        }
-
-        // reuse your existing identifier rule (you already have is_identifier used by obj_lhs)
-        if !is_identifier(cls) || !is_identifier(mname) {
-            continue;
-        }
-
-        class_methods.entry(cls.to_string()).or_default().push(obj);
-        in_class.insert(obj.index);
     }
 
-    // 2) emit classes first
-    for (cls, methods) in &class_methods {
-        writeln!(out, "class {} {{", cls)?;
-        for mobj in methods {
-            let name = mobj.name.as_deref().unwrap();
-            let (_cls, mname) = name.split_once('.').unwrap();
+    ret.map(|e| e.to_tjs_with(&fmt_var))
+}
 
-            writeln!(out, "  // == object {}: {} ==", mobj.index, name)?;
-            write!(out, "  function {}", mname)?;
+pub fn dump_src_file(file: &Tjs2File) -> Result<String> {
+    use std::collections::{BTreeMap, BTreeSet};
 
-            let (body, params) = emit_object_body(mobj, file, /*indent=*/4)?;
-            writeln!(out, "  ({}) {{", params)?;
-            for line in body.lines() {
-                writeln!(out, "{}", line)?;
-            }
+    let mut out = String::new();
+    writeln!(out, "// Decompiled by tjs2Decompiler (high)")?;
+    writeln!(out, "// objects={}, toplevel={}", file.objects.len(), file.toplevel)?;
+    writeln!(out)?;
 
-            writeln!(out, "  }}")?;
-            writeln!(out)?;
+    let toplevel = file.toplevel.max(0) as usize;
+
+    // owner_idx -> ordered members (name, obj_idx)
+    let mut owner_members: BTreeMap<usize, Vec<(String, usize)>> = BTreeMap::new();
+    let mut member_obj: BTreeSet<usize> = BTreeSet::new();
+    for owner in &file.objects {
+        let oidx = owner.index;
+        if owner.properties.is_empty() {
+            continue;
         }
+        let ent = owner_members.entry(oidx).or_default();
+        for (mname, midx) in &owner.properties {
+            if *midx < 0 {
+                continue;
+            }
+            let mi = *midx as usize;
+            if mi >= file.objects.len() {
+                continue;
+            }
+            let mname = file.const_pools.strings.get(*mname as usize).ok_or_else(|| anyhow::anyhow!("invalid string pool index"))?;
+            ent.push((mname.clone(), mi));
+            member_obj.insert(mi);
+        }
+    }
+
+    let mut class_owners: Vec<usize> = Vec::new();
+    for (&oidx, mems) in &owner_members {
+        if oidx == toplevel {
+            continue;
+        }
+        let o = &file.objects[oidx];
+        let Some(nm) = o.name.as_deref() else { continue; };
+        if !is_identifier(nm) {
+            continue;
+        }
+        let looks_like_class = mems.iter().any(|(_, mi)| {
+            let mo = &file.objects[*mi];
+            !mo.code.is_empty() || mo.prop_getter >= 0 || mo.prop_setter >= 0
+        });
+        if looks_like_class {
+            class_owners.push(oidx);
+        }
+    }
+
+    // === Emit classes ===
+    let mut emitted: Vec<bool> = vec![false; file.objects.len()];
+    if toplevel < emitted.len() {
+        emitted[toplevel] = true;
+    }
+
+    for oidx in class_owners {
+        let cls_obj = &file.objects[oidx];
+        let cls_name = cls_obj.name.as_deref().unwrap();
+
+
+        // writeln!(out, "class {} {{", cls_name)?;
+        let mut extends: Option<String> = None;
+        if let Some(cls_obj) = find_class_object(file, cls_name) {
+            if cls_obj.super_class_getter >= 0 {
+                let gi = cls_obj.super_class_getter as usize;
+                if gi < file.objects.len() {
+                    extends = infer_single_return_expr(file, &file.objects[gi]);
+                }
+            }
+        }
+
+        match extends {
+            Some(e) => writeln!(out, "class {} extends {} {{", cls_name, e)?,
+            None => writeln!(out, "class {} {{", cls_name)?,
+        }
+
+        if let Some(mems) = owner_members.get(&oidx) {
+            for (mname, midx) in mems {
+                let mobj = &file.objects[*midx];
+
+                if mobj.prop_getter >= 0 || mobj.prop_setter >= 0 {
+                    writeln!(out, "  property {} {{", mname)?;
+                    if mobj.prop_getter >= 0 {
+                        let gi = mobj.prop_getter as usize;
+                        if gi < file.objects.len() {
+                            let (body, _params) = emit_object_body(&file.objects[gi], file, 6)?;
+                            writeln!(out, "    getter() {{")?;
+                            write!(out, "{body}")?;
+                            writeln!(out, "    }}")?;
+                        }
+                    }
+                    if mobj.prop_setter >= 0 {
+                        let si = mobj.prop_setter as usize;
+                        if si < file.objects.len() {
+                            let (body, params) = emit_object_body(&file.objects[si], file, 6)?;
+                            let args = params;
+                            writeln!(out, "    setter({}) {{", args)?;
+                            write!(out, "{body}")?;
+                            writeln!(out, "    }}")?;
+                        }
+                    }
+                    writeln!(out, "  }}")?;
+                    emitted[*midx] = true;
+                    continue;
+                }
+
+                // method/function object
+                if !mobj.code.is_empty() {
+                    let (body, params) = emit_object_body(mobj, file, 6)?;
+                    let args = params;
+                    writeln!(out, "  function {}({}) {{", mname, args)?;
+                    write!(out, "{body}")?;
+                    writeln!(out, "  }}")?;
+                    emitted[*midx] = true;
+                    continue;
+                }
+
+                // fallback: member exists but no code (field)
+                writeln!(out, "  var {};", mname)?;
+                emitted[*midx] = true;
+            }
+        }
+
         writeln!(out, "}}")?;
         writeln!(out)?;
+        emitted[oidx] = true;
     }
 
-    // 3) emit remaining objects as globals (skip those already emitted in class)
+    // === Emit remaining top-level functions (not class members) ===
     for obj in &file.objects {
+        let idx = obj.index;
+        if idx == toplevel {
+            continue;
+        }
+        if idx < emitted.len() && emitted[idx] {
+            continue;
+        }
+        if member_obj.contains(&idx) {
+            continue;
+        }
+
         if obj.code.is_empty() {
             continue;
         }
-        if in_class.contains(&obj.index) {
-            continue;
-        }
 
-        let lhs = obj_lhs(obj.index, obj.name.as_deref());
-        write!(out, "{} = function", lhs)?;
-
-
-        let (body, params) = emit_object_body(obj, file, /*indent=*/2)?;
-        writeln!(out, "({}) {{", params)?;
-        for line in body.lines() {
-            writeln!(out, "{}", line)?;
-        }
-
+        let default_name = format!("__obj_{}", idx);
+        let name = obj.name.as_deref().unwrap_or(&default_name);
+        let (body, params) = emit_object_body(obj, file, 6)?;
+        let args = params;
+        writeln!(out, "function {}({}) {{", name, args)?;
+        write!(out, "{body}")?;
+        writeln!(out, "}}")?;
         writeln!(out)?;
     }
 
@@ -318,6 +519,7 @@ struct Structurer<'a> {
 
     // return expression per block (from SSA)
     ret_expr: Vec<Option<Expr>>,
+    uses_rv: bool,
 }
 
 impl<'a> Structurer<'a> {
@@ -336,6 +538,14 @@ impl<'a> Structurer<'a> {
 
         let loops = compute_natural_loops(prog, &dom, &reachable);
 
+        let uses_rv = prog.blocks.iter().any(|b| {
+            b.stmts.iter().any(|st| matches!(
+                st,
+                Stmt::Opaque { op, .. }
+                    if op.eq_ignore_ascii_case("SRV") || op.eq_ignore_ascii_case("VM_SRV")
+            ))
+        });
+
         Self {
             cfg,
             prog,
@@ -347,6 +557,7 @@ impl<'a> Structurer<'a> {
             loops,
             emitted: HashSet::new(),
             ret_expr,
+            uses_rv,
         }
     }
 
@@ -406,6 +617,8 @@ impl<'a> Structurer<'a> {
                             " ".repeat(indent),
                             self.expr_to_tjs(&e)
                         ));
+                    } else if self.uses_rv {
+                        out.push(format!("{}return __rv;", " ".repeat(indent)));
                     } else {
                         out.push(format!("{}return;", " ".repeat(indent)));
                     }

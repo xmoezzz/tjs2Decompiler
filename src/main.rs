@@ -75,7 +75,7 @@ fn main() -> Result<()> {
         Command::Tjs { path } => {
             let buf = fs::read(&path).with_context(|| format!("read {}", path))?;
             let file = load_tjs2_bytecode(&buf).context("parse structured TJS2 bytecode")?;
-            let text = dump_src_file_high(&file, Default::default()).context("build src")?;
+            let text = dump_src_file_high(&file).context("build src")?;
             print!("{}", text);
         }
     }
