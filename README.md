@@ -4,6 +4,9 @@ A minimal, strict **TJS2 (Kirikiri2 / Kirikiri-Z)** bytecode loader and disassem
 
 ## Features
 
+![Arch](asserts/arch.png)
+
+
 * **Disassemble**: Convert binary bytecode into human-readable assembly mnemonics.
 * **SSA&HLIR**: Generate Static Single Assignment (SSA) form or High-Level Intermediate Representation (HLIR) for deep code analysis.
 * **Decompilation**: Attempt to reconstruct high-level TJS2 source code.
