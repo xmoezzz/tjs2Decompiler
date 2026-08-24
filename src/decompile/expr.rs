@@ -7,8 +7,19 @@ pub enum UnOp {
     Neg,
     Not,
     BitNot,
+    Num,
+    CharCode,
+    CharFromCode,
     Typeof,
     Delete,
+    Int,
+    Real,
+    String,
+    Octet,
+    Invalidate,
+    IsValid,
+    /// TJS unary `&`: access the underlying property substance, bypassing getter/setter dispatch.
+    IgnoreProp,
 }
 
 impl UnOp {
@@ -17,13 +28,33 @@ impl UnOp {
             UnOp::Neg => "-",
             UnOp::Not => "!",
             UnOp::BitNot => "~",
+            UnOp::Num => "+",
+            UnOp::CharCode => "#",
+            UnOp::CharFromCode => "$",
             UnOp::Typeof => "typeof",
             UnOp::Delete => "delete",
+            UnOp::Int => "int",
+            UnOp::Real => "real",
+            UnOp::String => "string",
+            UnOp::Octet => "octet",
+            UnOp::Invalidate => "invalidate",
+            UnOp::IsValid => "isvalid",
+            UnOp::IgnoreProp => "&",
         }
     }
 
     pub fn needs_space(self) -> bool {
-        matches!(self, UnOp::Typeof | UnOp::Delete)
+        matches!(
+            self,
+            UnOp::Typeof
+                | UnOp::Delete
+                | UnOp::Int
+                | UnOp::Real
+                | UnOp::String
+                | UnOp::Octet
+                | UnOp::Invalidate
+                | UnOp::IsValid
+        )
     }
 }
 
@@ -33,6 +64,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    IDiv,
     Mod,
 
     Shl,
@@ -45,6 +77,7 @@ pub enum BinOp {
     Ge,
 
     In,
+    InstanceOf,
 
     Eq,
     Ne,
@@ -64,6 +97,7 @@ pub enum BinOp {
     SubAssign,
     MulAssign,
     DivAssign,
+    IDivAssign,
     ModAssign,
     ShlAssign,
     ShrAssign,
@@ -71,6 +105,10 @@ pub enum BinOp {
     AndAssign,
     OrAssign,
     XorAssign,
+    LogAndAssign,
+    LogOrAssign,
+
+    InContextOf,
 }
 
 impl BinOp {
@@ -80,6 +118,7 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::IDiv => "\\",
             BinOp::Mod => "%",
 
             BinOp::Shl => "<<",
@@ -92,6 +131,7 @@ impl BinOp {
             BinOp::Ge => ">=",
 
             BinOp::In => "in",
+            BinOp::InstanceOf => "instanceof",
 
             BinOp::Eq => "==",
             BinOp::Ne => "!=",
@@ -111,6 +151,7 @@ impl BinOp {
             BinOp::SubAssign => "-=",
             BinOp::MulAssign => "*=",
             BinOp::DivAssign => "/=",
+            BinOp::IDivAssign => "\\=",
             BinOp::ModAssign => "%=",
             BinOp::ShlAssign => "<<=",
             BinOp::ShrAssign => ">>=",
@@ -118,6 +159,9 @@ impl BinOp {
             BinOp::AndAssign => "&=",
             BinOp::OrAssign => "|=",
             BinOp::XorAssign => "^=",
+            BinOp::LogAndAssign => "&&=",
+            BinOp::LogOrAssign => "||=",
+            BinOp::InContextOf => "incontextof",
         }
     }
 
@@ -129,13 +173,16 @@ impl BinOp {
             | BinOp::SubAssign
             | BinOp::MulAssign
             | BinOp::DivAssign
+            | BinOp::IDivAssign
             | BinOp::ModAssign
             | BinOp::ShlAssign
             | BinOp::ShrAssign
             | BinOp::UShrAssign
             | BinOp::AndAssign
             | BinOp::OrAssign
-            | BinOp::XorAssign => 0,
+            | BinOp::XorAssign
+            | BinOp::LogAndAssign
+            | BinOp::LogOrAssign => 0,
 
             BinOp::LogOr => 1,
             BinOp::LogAnd => 2,
@@ -146,13 +193,19 @@ impl BinOp {
 
             BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe => 6,
 
-            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::In => 7,
+            BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::In
+            | BinOp::InstanceOf
+            | BinOp::InContextOf => 7,
 
             BinOp::Shl | BinOp::Shr | BinOp::UShr => 8,
 
             BinOp::Add | BinOp::Sub => 9,
 
-            BinOp::Mul | BinOp::Div | BinOp::Mod => 10,
+            BinOp::Mul | BinOp::Div | BinOp::IDiv | BinOp::Mod => 10,
         }
     }
 
@@ -164,6 +217,7 @@ impl BinOp {
                 | BinOp::SubAssign
                 | BinOp::MulAssign
                 | BinOp::DivAssign
+                | BinOp::IDivAssign
                 | BinOp::ModAssign
                 | BinOp::ShlAssign
                 | BinOp::ShrAssign
@@ -171,6 +225,8 @@ impl BinOp {
                 | BinOp::AndAssign
                 | BinOp::OrAssign
                 | BinOp::XorAssign
+                | BinOp::LogAndAssign
+                | BinOp::LogOrAssign
         )
     }
 }
@@ -192,14 +248,50 @@ pub enum Expr {
     Real(f64),
     Str(String),
     Octet(Vec<u8>),
+    ObjectRef(i32),
+    GeneratorRef(i32),
+
+    /// VM register %-2.  This is not `global` and not `this`: it is the TJS
+    /// scope proxy that dispatches to `this` first and then to `global`.
+    /// It may only be lowered back to source when the surrounding operation
+    /// has an exact source spelling (for example a bare identifier).
+    ScopeProxy,
 
     Unary(UnOp, Box<Expr>),
     Deref(Box<Expr>),
 
     Binary(BinOp, Box<Expr>, Box<Expr>),
 
+    /// Source conditional expression.  Keep this as an explicit IR node
+    /// instead of spelling it as opaque text so SSA/dataflow rewrites can
+    /// continue to inspect all three operands and their effects.
+    Conditional {
+        cond: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
+
     Call(Box<Expr>, Vec<Expr>),
     New(Box<Expr>, Vec<Expr>),
+
+    /// Source-level inline Array/Dictionary literals.  The compiler lowers
+    /// these to `new global.Array/Dictionary` plus ordered SPIS stores; keep
+    /// them explicit once that exact builder pattern has been recognized.
+    ArrayLiteral(Vec<Expr>),
+    DictionaryLiteral(Vec<(Expr, Expr)>),
+
+    /// Source-level RegExp literal, reconstructed only from the exact compiler
+    /// template `new global.RegExp(); obj._compile(internal_pattern)`.
+    /// The stored string is the complete TJS source token, e.g. `/foo/gi`.
+    RegExpLiteral(String),
+
+    // TJS2 call-argument forms that cannot be represented as ordinary value
+    // expressions.  These are only emitted inside Call/New/MethodCall args.
+    // `x*` expands an explicit array-like argument, `*` expands unnamed
+    // arguments, and `...` forwards the current function arguments verbatim.
+    ArgExpand(Box<Expr>),
+    ArgUnnamedExpand,
+    ArgForwardAll,
 
     Index(Box<Expr>, Box<Expr>),
     Member(Box<Expr>, String),
@@ -237,7 +329,18 @@ impl Expr {
             | Expr::Int(_)
             | Expr::Real(_)
             | Expr::Str(_)
-            | Expr::Octet(_) => 20,
+            | Expr::Octet(_)
+            | Expr::ObjectRef(_)
+            | Expr::GeneratorRef(_)
+            | Expr::ScopeProxy
+            | Expr::ArrayLiteral(_)
+            | Expr::DictionaryLiteral(_)
+            | Expr::RegExpLiteral(_)
+            | Expr::Conditional { .. }
+            | Expr::ArgUnnamedExpand
+            | Expr::ArgForwardAll => 20,
+
+            Expr::ArgExpand(..) => 19,
 
             Expr::Member(..) | Expr::Index(..) | Expr::Call(..) | Expr::MethodCall { .. } => 19,
 
@@ -269,7 +372,7 @@ impl Expr {
                 if *r <= -3 {
                     write!(f, "a{}", -3 - r)?
                 } else if *r == -2 {
-                    write!(f, "global")?
+                    write!(f, "__tjs2dec_unrepresentable_scope_proxy")?
                 } else if *r == -1 {
                     write!(f, "this")?
                 } else {
@@ -285,35 +388,52 @@ impl Expr {
             Expr::Null => write!(f, "null")?,
             Expr::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" })?,
             Expr::Int(i) => write!(f, "{}", i)?,
-            Expr::Real(x) => write!(f, "{}", x)?,
-            Expr::Str(s) => write!(f, "\"{}\"", escape_tjs_string(s))?,
-            Expr::Octet(bytes) => {
-                if bytes.is_empty() {
-                    write!(f, "octet(0)")?;
+            Expr::Real(x) => {
+                // Rust's Debug formatter uses a shortest round-trippable decimal
+                // and, unlike Display, keeps an integral-valued real as `1.0`.
+                // TJS also has exact source spellings for infinities and for
+                // its canonical quiet NaN.  Preserve NaN sign and reject any
+                // non-canonical payload rather than silently normalizing bits.
+                if x.is_finite() {
+                    write!(f, "{:?}", x)?;
                 } else {
-                    let mut preview = String::new();
-                    let n = bytes.len().min(16);
-                    for (i, b) in bytes.iter().take(n).enumerate() {
-                        if i != 0 {
-                            preview.push(' ');
-                        }
-                        preview.push_str(&format!("{:02x}", b));
-                    }
-                    if bytes.len() > n {
-                        write!(f, "octet(len={}, head={})", bytes.len(), preview)?;
-                    } else {
-                        write!(f, "octet(len={}, bytes={})", bytes.len(), preview)?;
+                    match x.to_bits() {
+                        0x7ff0_0000_0000_0000 => write!(f, "Infinity")?,
+                        0xfff0_0000_0000_0000 => write!(f, "-Infinity")?,
+                        0x7ff8_0000_0000_0000 => write!(f, "NaN")?,
+                        0xfff8_0000_0000_0000 => write!(f, "-NaN")?,
+                        _ => write!(f, "__tjs2dec_unrepresentable_real_literal")?,
                     }
                 }
             }
+            Expr::Str(s) => write!(f, "\"{}\"", escape_tjs_string(s))?,
+            Expr::ObjectRef(idx) => write!(f, "__tjs2dec_obj_{}", idx)?,
+            Expr::GeneratorRef(idx) => write!(f, "__tjs2dec_gen_{}", idx)?,
+            Expr::ScopeProxy => write!(f, "__tjs2dec_unrepresentable_scope_proxy")?,
+            Expr::Octet(bytes) => {
+                write!(f, "<%")?;
+                for b in bytes {
+                    write!(f, " {:02x}", b)?;
+                }
+                if !bytes.is_empty() {
+                    write!(f, " ")?;
+                }
+                write!(f, "%>")?;
+            }
 
             Expr::Unary(op, e) => {
-                if op.needs_space() {
-                    write!(f, "{} ", op.op_str())?;
+                if *op == UnOp::IgnoreProp {
+                    write!(f, "&(")?;
+                    e.fmt_with_prec(f, 0, fmt_var)?;
+                    write!(f, ")")?;
                 } else {
-                    write!(f, "{}", op.op_str())?;
+                    if op.needs_space() {
+                        write!(f, "{} ", op.op_str())?;
+                    } else {
+                        write!(f, "{}", op.op_str())?;
+                    }
+                    e.fmt_with_prec(f, my_prec, fmt_var)?;
                 }
-                e.fmt_with_prec(f, my_prec, fmt_var)?;
             }
 
             Expr::Deref(e) => {
@@ -327,6 +447,24 @@ impl Expr {
                 l.fmt_with_prec(f, lp, fmt_var)?;
                 write!(f, " {} ", op.op_str())?;
                 r.fmt_with_prec(f, rp, fmt_var)?;
+            }
+
+            Expr::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                // Parenthesize the complete conditional unconditionally.  It
+                // avoids depending on small precedence differences between
+                // TJS versions and makes nested conditional reconstruction
+                // unambiguous without changing evaluation order.
+                write!(f, "(")?;
+                cond.fmt_with_prec(f, 0, fmt_var)?;
+                write!(f, " ? ")?;
+                then_expr.fmt_with_prec(f, 0, fmt_var)?;
+                write!(f, " : ")?;
+                else_expr.fmt_with_prec(f, 0, fmt_var)?;
+                write!(f, ")")?;
             }
 
             Expr::Call(callee, args) => {
@@ -354,21 +492,82 @@ impl Expr {
                 write!(f, ")")?;
             }
 
-            Expr::Index(base, key) => {
-                base.fmt_with_prec(f, 19, fmt_var)?;
+            Expr::ArrayLiteral(items) => {
                 write!(f, "[")?;
-                key.fmt_with_prec(f, 0, fmt_var)?;
+                for (i, item) in items.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    item.fmt_with_prec(f, 0, fmt_var)?;
+                }
                 write!(f, "]")?;
             }
 
+            Expr::DictionaryLiteral(items) => {
+                write!(f, "%[")?;
+                for (i, (key, value)) in items.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    key.fmt_with_prec(f, 0, fmt_var)?;
+                    write!(f, " => ")?;
+                    value.fmt_with_prec(f, 0, fmt_var)?;
+                }
+                write!(f, "]")?;
+            }
+
+            Expr::RegExpLiteral(source) => write!(f, "{}", source)?,
+
+            Expr::ArgExpand(expr) => {
+                expr.fmt_with_prec(f, 19, fmt_var)?;
+                write!(f, "*")?;
+            }
+            Expr::ArgUnnamedExpand => write!(f, "*")?,
+            Expr::ArgForwardAll => write!(f, "...")?,
+
+            Expr::Index(base, key) => {
+                if matches!(base.as_ref(), Expr::ScopeProxy) {
+                    // There is no source-level expression denoting the proxy itself.
+                    // Keep an unmistakable invalid sentinel; the semantic audit rejects
+                    // this before source is returned to the caller.
+                    write!(f, "__tjs2dec_unrepresentable_scope_proxy[")?;
+                    key.fmt_with_prec(f, 0, fmt_var)?;
+                    write!(f, "]")?;
+                } else {
+                    base.fmt_with_prec(f, 19, fmt_var)?;
+                    write!(f, "[")?;
+                    key.fmt_with_prec(f, 0, fmt_var)?;
+                    write!(f, "]")?;
+                }
+            }
+
             Expr::Member(base, member) => {
-                base.fmt_with_prec(f, 19, fmt_var)?;
-                write!(f, ".{}", member)?;
+                if matches!(base.as_ref(), Expr::ScopeProxy) {
+                    // `% -2 .*name` is a source-level bare identifier only if
+                    // it cannot be captured by one of our synthetic lexical
+                    // bindings (and is itself legal as an identifier).
+                    if scope_proxy_ident_is_safe(member) {
+                        write!(f, "{}", member)?;
+                    } else {
+                        write!(f, "__tjs2dec_unrepresentable_scope_proxy")?;
+                    }
+                } else {
+                    base.fmt_with_prec(f, 19, fmt_var)?;
+                    write!(f, ".{}", member)?;
+                }
             }
 
             Expr::MethodCall { base, member, args } => {
-                base.fmt_with_prec(f, 19, fmt_var)?;
-                write!(f, ".{}(", member)?;
+                if matches!(base.as_ref(), Expr::ScopeProxy) {
+                    if scope_proxy_ident_is_safe(member) {
+                        write!(f, "{}(", member)?;
+                    } else {
+                        write!(f, "__tjs2dec_unrepresentable_scope_proxy(")?;
+                    }
+                } else {
+                    base.fmt_with_prec(f, 19, fmt_var)?;
+                    write!(f, ".{}(", member)?;
+                }
                 for (i, a) in args.iter().enumerate() {
                     if i != 0 {
                         write!(f, ", ")?;
@@ -413,7 +612,7 @@ fn fmt_vid_default(vid: VarId) -> String {
             if r <= -3 {
                 format!("a{}", -3 - r)
             } else if r == -2 {
-                "global".to_string()
+                "__tjs2dec_unrepresentable_scope_proxy".to_string()
             } else if r == -1 {
                 "this".to_string()
             } else {
@@ -421,11 +620,68 @@ fn fmt_vid_default(vid: VarId) -> String {
             }
         }
         Var::Flag => format!("flag#{}", vid.ver),
+        Var::Result => format!("result#{}", vid.ver),
         Var::Exception => format!("exc#{}", vid.ver),
     }
 }
 
-pub fn escape_tjs_string(s: &str) -> String {
+pub fn generated_ident_collision(s: &str) -> bool {
+    if s.starts_with("__tjs2dec_") {
+        return true;
+    }
+    fn digits_after<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        let rest = s.strip_prefix(prefix)?;
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            Some(rest)
+        } else {
+            None
+        }
+    }
+    if digits_after(s, "a").is_some()
+        || digits_after(s, "_fr").is_some()
+        || digits_after(s, "flag_").is_some()
+        || digits_after(s, "exc_").is_some()
+    {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix('r') {
+        if let Some((reg, ver)) = rest.split_once('_') {
+            if !reg.is_empty()
+                && !ver.is_empty()
+                && reg.bytes().all(|b| b.is_ascii_digit())
+                && ver.bytes().all(|b| b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_tjs_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "break" | "continue" | "const" | "catch" | "class" | "case" | "debugger"
+            | "default" | "delete" | "do" | "else" | "export" | "extends" | "finally"
+            | "for" | "function" | "global" | "if" | "import" | "in" | "incontextof"
+            | "instanceof" | "int" | "invalidate" | "isvalid" | "new" | "octet"
+            | "property" | "private" | "protected" | "public" | "real" | "return"
+            | "static" | "string" | "super" | "switch" | "synchronized" | "this"
+            | "throw" | "try" | "typeof" | "var" | "void" | "while" | "with"
+            | "true" | "false" | "null"
+    )
+}
+
+fn scope_proxy_ident_is_safe(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false; };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !generated_ident_collision(s)
+        && !is_tjs_keyword(s)
+}
+
+fn escape_tjs_string(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
         match c {
@@ -439,4 +695,108 @@ pub fn escape_tjs_string(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BinOp, Expr, UnOp};
+
+    #[test]
+    fn renders_tjs_vm_unary_operators() {
+        assert_eq!(
+            Expr::Unary(UnOp::CharCode, Box::new(Expr::Str("A".into()))).to_tjs(),
+            "#\"A\""
+        );
+        assert_eq!(
+            Expr::Unary(UnOp::CharFromCode, Box::new(Expr::Int(65))).to_tjs(),
+            "$65"
+        );
+        assert_eq!(
+            Expr::Unary(UnOp::Num, Box::new(Expr::Str("123".into()))).to_tjs(),
+            "+\"123\""
+        );
+        assert_eq!(
+            Expr::Unary(UnOp::Invalidate, Box::new(Expr::Reg(1))).to_tjs(),
+            "invalidate r1"
+        );
+        assert_eq!(
+            Expr::Unary(UnOp::IsValid, Box::new(Expr::Reg(1))).to_tjs(),
+            "isvalid r1"
+        );
+    }
+
+    #[test]
+    fn renders_integer_division() {
+        assert_eq!(
+            Expr::Binary(BinOp::IDiv, Box::new(Expr::Int(7)), Box::new(Expr::Int(3))).to_tjs(),
+            "7 \\ 3"
+        );
+    }
+
+    #[test]
+    fn renders_instanceof_and_incontextof() {
+        assert_eq!(
+            Expr::Binary(
+                BinOp::InstanceOf,
+                Box::new(Expr::Reg(1)),
+                Box::new(Expr::Str("Array".into())),
+            )
+            .to_tjs(),
+            "r1 instanceof \"Array\""
+        );
+        assert_eq!(
+            Expr::Binary(
+                BinOp::InContextOf,
+                Box::new(Expr::Reg(1)),
+                Box::new(Expr::Reg(-1)),
+            )
+            .to_tjs(),
+            "r1 incontextof this"
+        );
+    }
+
+    #[test]
+    fn renders_inline_collection_literals() {
+        assert_eq!(
+            Expr::ArrayLiteral(vec![Expr::Int(1), Expr::Str("x".into())]).to_tjs(),
+            "[1, \"x\"]"
+        );
+        assert_eq!(
+            Expr::DictionaryLiteral(vec![
+                (Expr::Str("a".into()), Expr::Int(1)),
+                (Expr::Str("b".into()), Expr::Int(2)),
+            ])
+            .to_tjs(),
+            "%[\"a\" => 1, \"b\" => 2]"
+        );
+    }
+
+    #[test]
+    fn renders_exact_tjs_nonfinite_literals() {
+        assert_eq!(Expr::Real(f64::INFINITY).to_tjs(), "Infinity");
+        assert_eq!(Expr::Real(f64::NEG_INFINITY).to_tjs(), "-Infinity");
+        assert_eq!(Expr::Real(f64::from_bits(0x7ff8_0000_0000_0000)).to_tjs(), "NaN");
+        assert_eq!(Expr::Real(f64::from_bits(0xfff8_0000_0000_0000)).to_tjs(), "-NaN");
+        assert_eq!(
+            Expr::Real(f64::from_bits(0x7ff8_0000_0000_0001)).to_tjs(),
+            "__tjs2dec_unrepresentable_real_literal"
+        );
+    }
+
+    #[test]
+    fn renders_tjs_extended_call_arguments() {
+        let call = Expr::Call(
+            Box::new(Expr::Reg(1)),
+            vec![
+                Expr::Reg(2),
+                Expr::ArgExpand(Box::new(Expr::Reg(3))),
+                Expr::ArgUnnamedExpand,
+            ],
+        );
+        assert_eq!(call.to_tjs(), "r1(r2, r3*, *)");
+
+        let forwarded = Expr::Call(Box::new(Expr::Reg(1)), vec![Expr::ArgForwardAll]);
+        assert_eq!(forwarded.to_tjs(), "r1(...)");
+    }
+
 }

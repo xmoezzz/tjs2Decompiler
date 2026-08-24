@@ -37,7 +37,8 @@ fn decompile_action_tjs_if_present() {
 
     assert!(!tjs.is_empty());
     assert!(tjs.contains("function __tjs2dec_obj_"));
-    assert!(tjs.contains("var __tjs2dec_objs"));
+    assert!(tjs.contains("return (function(__tjs2dec_top_this)"));
+    assert!(tjs.contains("incontextof __tjs2dec_top_this"));
 }
 
 #[test]

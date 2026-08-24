@@ -194,6 +194,7 @@ fn fmt_vid(v: VarId) -> String {
     match v.var {
         Var::Reg(r) => format!("r{}#{}", r, v.ver),
         Var::Flag => format!("flag#{}", v.ver),
+        Var::Result => format!("result#{}", v.ver),
         Var::Exception => format!("exc#{}", v.ver),
     }
 }

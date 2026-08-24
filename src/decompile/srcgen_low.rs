@@ -70,6 +70,7 @@ fn fmt_vid(vid: VarId) -> String {
     match vid.var {
         Var::Reg(r) => format!("__r{}_{}", r, vid.ver),
         Var::Flag => format!("__flag_{}", vid.ver),
+        Var::Result => format!("__result_{}", vid.ver),
         Var::Exception => format!("__exc_{}", vid.ver),
     }
 }
@@ -88,7 +89,6 @@ fn emit_function(out: &mut String, prog: &ExprProgram, cfg: &Cfg, obj: &Tjs2Obje
         }
     }
 
-    writeln!(out, "  var __rv = void;")?;
     writeln!(out, "  var __bb = {};", prog.entry_block)?;
     writeln!(out, "  var __exobj = void;")?;
     writeln!(out, "  while(true) {{")?;
@@ -110,6 +110,9 @@ fn emit_function(out: &mut String, prog: &ExprProgram, cfg: &Cfg, obj: &Tjs2Obje
             emit_block_body(out, b, &fmt_var, &phi_moves, obj, ex)?;
             writeln!(out, "        }} catch(__e) {{")?;
             writeln!(out, "          __exobj = __e;")?;
+            if let Some(exc) = exception_input_var(&prog.blocks[ex]) {
+                writeln!(out, "          {} = __e;", fmt_var(exc))?;
+            }
             emit_phi_parallel_copies(out, &fmt_var, &phi_moves, b.id, ex, "          ")?;
             writeln!(out, "          __bb = {};", ex)?;
             writeln!(out, "          continue;")?;
@@ -122,7 +125,7 @@ fn emit_function(out: &mut String, prog: &ExprProgram, cfg: &Cfg, obj: &Tjs2Obje
     }
 
     // default escape hatch
-    writeln!(out, "      default: return __rv;")?;
+    writeln!(out, "      default: return;")?;
     writeln!(out, "    }}")?;
     writeln!(out, "  }}")?;
 
@@ -164,6 +167,13 @@ fn emit_stmt(out: &mut String, st: &Stmt, fmt_var: &dyn Fn(VarId) -> String) -> 
                 value.to_tjs_with(fmt_var)
             )?;
         }
+        Stmt::MemberDecl { name, value } => {
+            if matches!(value, Expr::Void) {
+                writeln!(out, "        var {};", name)?;
+            } else {
+                writeln!(out, "        var {} = {};", name, value.to_tjs_with(fmt_var))?;
+            }
+        }
         Stmt::Update {
             dst,
             target,
@@ -184,6 +194,24 @@ fn emit_stmt(out: &mut String, st: &Stmt, fmt_var: &dyn Fn(VarId) -> String) -> 
             writeln!(out, "        {} = {};", target.to_tjs_with(fmt_var), tmp)?;
             if let Some(d) = dst {
                 writeln!(out, "        {} = {};", fmt_var(*d), tmp)?;
+            }
+        }
+        Stmt::IncDec {
+            dst,
+            target,
+            increment,
+        } => {
+            let op = if *increment { "++" } else { "--" };
+            if let Some(d) = dst {
+                writeln!(
+                    out,
+                    "        {} = {}{};",
+                    fmt_var(*d),
+                    op,
+                    target.to_tjs_with(fmt_var)
+                )?;
+            } else {
+                writeln!(out, "        {}{};", op, target.to_tjs_with(fmt_var))?;
             }
         }
         Stmt::Expr(e) => {
@@ -240,14 +268,25 @@ fn emit_terminator(
             writeln!(out, "          continue;")?;
             writeln!(out, "        }}")?;
         }
-        Terminator::Ret => {
-            writeln!(out, "        return __rv;")?;
+        Terminator::Ret(e) => {
+            let value = e.to_tjs_with(fmt_var);
+            if value == "void" || value == "__result_0" {
+                writeln!(out, "        return;")?;
+            } else {
+                writeln!(out, "        return {};", value)?;
+            }
         }
         Terminator::Throw(e) => {
             writeln!(out, "        throw {};", e.to_tjs_with(fmt_var))?;
         }
         Terminator::Exit => {
-            writeln!(out, "        return __rv;")?;
+            if let Some(t) = b.succ.first().copied() {
+                emit_phi_parallel_copies(out, fmt_var, phi_moves, b.id, t, "        ")?;
+                writeln!(out, "        __bb = {};", t)?;
+                writeln!(out, "        continue;")?;
+            } else {
+                writeln!(out, "        return;")?;
+            }
         }
         Terminator::Fallthrough => {
             if let Some(t) = b.succ.first().copied() {
@@ -262,18 +301,25 @@ fn emit_terminator(
     Ok(())
 }
 
+fn exception_input_var(b: &ExprBlock) -> Option<VarId> {
+    // Preserve the handler-entry EXCIN definition independently of optimized
+    // statements.  EXCDEF may be propagated away before the low-level source
+    // generator runs.
+    b.exception_in
+}
+
 fn exceptional_succ(b: &ExprBlock) -> Option<usize> {
     let normal = match b.term {
         Terminator::Jmp(_) => 1,
         Terminator::Br { .. } => 2,
-        Terminator::Fallthrough => {
+        Terminator::Fallthrough | Terminator::Exit => {
             if b.succ.is_empty() {
                 0
             } else {
                 1
             }
         }
-        Terminator::Ret | Terminator::Throw(_) | Terminator::Exit => 0,
+        Terminator::Ret(_) | Terminator::Throw(_) => 0,
     };
     if b.succ.len() > normal {
         // CFG builder appends exceptional succ conservatively at the end.
@@ -361,6 +407,7 @@ fn collect_all_vars(prog: &ExprProgram) -> Vec<String> {
                     collect_expr_vars(target, &mut set);
                     collect_expr_vars(value, &mut set);
                 }
+                Stmt::MemberDecl { value, .. } => collect_expr_vars(value, &mut set),
                 Stmt::Update {
                     dst, target, rhs, ..
                 } => {
@@ -369,6 +416,12 @@ fn collect_all_vars(prog: &ExprProgram) -> Vec<String> {
                     }
                     collect_expr_vars(target, &mut set);
                     collect_expr_vars(rhs, &mut set);
+                }
+                Stmt::IncDec { dst, target, .. } => {
+                    if let Some(d) = dst {
+                        set.insert(*d);
+                    }
+                    collect_expr_vars(target, &mut set);
                 }
                 Stmt::Expr(e) => collect_expr_vars(e, &mut set),
                 Stmt::Opaque { args, defs, .. } => {
@@ -384,7 +437,7 @@ fn collect_all_vars(prog: &ExprProgram) -> Vec<String> {
 
         match &b.term {
             Terminator::Br { cond, .. } => collect_expr_vars(cond, &mut set),
-            Terminator::Throw(e) => collect_expr_vars(e, &mut set),
+            Terminator::Ret(e) | Terminator::Throw(e) => collect_expr_vars(e, &mut set),
             _ => {}
         }
     }
@@ -400,7 +453,7 @@ fn collect_expr_vars(e: &Expr, out: &mut HashSet<VarId>) {
         Expr::SsaVar(v) => {
             out.insert(*v);
         }
-        Expr::Unary(_, x) | Expr::Deref(x) => {
+        Expr::Unary(_, x) | Expr::Deref(x) | Expr::ArgExpand(x) => {
             collect_expr_vars(x, out);
         }
         Expr::Binary(_, a, b) => {
@@ -424,6 +477,17 @@ fn collect_expr_vars(e: &Expr, out: &mut HashSet<VarId>) {
             collect_expr_vars(base, out);
             for a in args {
                 collect_expr_vars(a, out);
+            }
+        }
+        Expr::ArrayLiteral(items) => {
+            for a in items {
+                collect_expr_vars(a, out);
+            }
+        }
+        Expr::DictionaryLiteral(items) => {
+            for (k, v) in items {
+                collect_expr_vars(k, out);
+                collect_expr_vars(v, out);
             }
         }
         Expr::Opaque(_, args) => {

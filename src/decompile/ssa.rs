@@ -10,6 +10,9 @@ use super::cfg::{BasicBlock, Cfg};
 pub enum Var {
     Reg(i32),
     Flag,
+    /// VM function-result slot written by SRV and consumed by RET.
+    Result,
+    /// Exception object injected on an exceptional edge into a catch handler.
     Exception,
 }
 
@@ -83,11 +86,73 @@ impl SsaProgram {
         }
 
         rename(cfg, &dom, &mut ssa_blocks);
-        Ok(Self {
+        let program = Self {
             obj_index: cfg.obj_index,
             blocks: ssa_blocks,
             entry_block: cfg.entry_block,
-        })
+        };
+        program.validate()?;
+        Ok(program)
+    }
+
+    /// Verify the core SSA invariant: every non-live-in version has exactly one
+    /// definition and every non-zero use refers to a definition.  Keeping this
+    /// check next to construction prevents later source passes from silently
+    /// compensating for malformed SSA.
+    pub fn validate(&self) -> Result<()> {
+        let mut defs: HashMap<VarId, String> = HashMap::new();
+
+        let mut record_def = |id: VarId, where_: String| -> Result<()> {
+            if id.ver == 0 {
+                return Ok(());
+            }
+            if let Some(prev) = defs.insert(id, where_.clone()) {
+                anyhow::bail!(
+                    "SSA value {} has multiple definitions: {} and {}",
+                    fmt_varid(id),
+                    prev,
+                    where_
+                );
+            }
+            Ok(())
+        };
+
+        for b in &self.blocks {
+            for p in &b.phi {
+                record_def(p.result, format!("bb{} phi", b.id))?;
+            }
+            for insn in &b.insns {
+                for &d in &insn.defs {
+                    record_def(d, format!("bb{} pc{} {}", b.id, insn.pc, insn.mnemonic))?;
+                }
+            }
+        }
+        drop(record_def);
+
+        let check_use = |id: VarId, where_: &str| -> Result<()> {
+            if id.ver != 0 && !defs.contains_key(&id) {
+                anyhow::bail!(
+                    "SSA value {} used without a definition at {}",
+                    fmt_varid(id),
+                    where_
+                );
+            }
+            Ok(())
+        };
+
+        for b in &self.blocks {
+            for p in &b.phi {
+                for (pred, v) in &p.args {
+                    check_use(*v, &format!("bb{} phi incoming from bb{}", b.id, pred))?;
+                }
+            }
+            for insn in &b.insns {
+                for &u in &insn.uses {
+                    check_use(u, &format!("bb{} pc{} {}", b.id, insn.pc, insn.mnemonic))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn dump(&self) -> String {
@@ -155,6 +220,7 @@ fn fmt_var(v: Var) -> &'static str {
     match v {
         Var::Reg(_) => "reg",
         Var::Flag => "flag",
+        Var::Result => "result",
         Var::Exception => "exception",
     }
 }
@@ -163,6 +229,7 @@ fn fmt_varid(id: VarId) -> String {
     match id.var {
         Var::Reg(r) => format!("r{}#{}", r, id.ver),
         Var::Flag => format!("flag#{}", id.ver),
+        Var::Result => format!("result#{}", id.ver),
         Var::Exception => format!("exc#{}", id.ver),
     }
 }
@@ -279,6 +346,7 @@ impl DomInfo {
 fn collect_vars(blocks: &[BasicBlock]) -> BTreeSet<Var> {
     let mut vars = BTreeSet::new();
     vars.insert(Var::Flag);
+    vars.insert(Var::Result);
 
     for b in blocks {
         for insn in &b.insns {
@@ -345,7 +413,11 @@ fn rename(cfg: &Cfg, dom: &DomInfo, blocks: &mut [SsaBlock]) {
     }
     counters.entry(Var::Flag).or_insert(0);
     stacks.entry(Var::Flag).or_default();
-    // Exception is a pseudo source; version 0 is fine.
+    // Result#0 is the VM's initial `void` function-result slot.
+    counters.entry(Var::Result).or_insert(0);
+    stacks.entry(Var::Result).or_default();
+    // Exception is an implicit source at catch entry; each handler gets a fresh
+    // SSA definition below.
     counters.entry(Var::Exception).or_insert(0);
     stacks.entry(Var::Exception).or_default();
 
@@ -389,19 +461,31 @@ fn rename(cfg: &Cfg, dom: &DomInfo, blocks: &mut [SsaBlock]) {
             pushed.push(p.var);
         }
 
-        // Insert a pseudo "exception store" at catch entries: rEx = exc.
+        // Materialize the implicit exception value at catch entries.  Give every
+        // handler its own exception SSA definition, then copy it into the VM's
+        // declared exception register.  This keeps catch values from different
+        // handlers from collapsing into one global `exc#0` pseudo-source.
         if let Some(&ex_reg) = cfg.catch_sites.get(&blocks[bid].start_pc) {
+            let exc_id = new_ver(Var::Exception, counters, stacks);
+            pushed.push(Var::Exception);
+            blocks[bid].insns.push(SsaInsn {
+                pc: blocks[bid].start_pc,
+                op: -2,
+                mnemonic: "EXCIN",
+                raw_ops: Vec::new(),
+                uses: Vec::new(),
+                defs: vec![exc_id],
+            });
+
             let dst = Var::Reg(ex_reg);
-            let src = Var::Exception;
             let dst_id = new_ver(dst, counters, stacks);
             pushed.push(dst);
-            let src_id = cur(src, stacks);
             blocks[bid].insns.push(SsaInsn {
                 pc: blocks[bid].start_pc,
                 op: -1,
                 mnemonic: "EXCDEF",
                 raw_ops: vec![ex_reg],
-                uses: vec![src_id],
+                uses: vec![exc_id],
                 defs: vec![dst_id],
             });
         }
@@ -486,15 +570,13 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
         }
     };
 
-    // Opcodes that define/consume the flag.
-    // Note: SETF/SETNF are constant-set-to-register, not flag operations.
+    // Opcodes that define/consume the VM condition flag.
     if matches!(
         op,
         vm::VM_CEQ
             | vm::VM_CDEQ
             | vm::VM_CLT
             | vm::VM_CGT
-            | vm::VM_CHKINS
             | vm::VM_TT
             | vm::VM_TF
             | vm::VM_NF
@@ -507,8 +589,7 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
             x if x == vm::VM_CEQ
                 || x == vm::VM_CDEQ
                 || x == vm::VM_CLT
-                || x == vm::VM_CGT
-                || x == vm::VM_CHKINS =>
+                || x == vm::VM_CGT =>
             {
                 uses.push(r(0));
                 uses.push(r(1));
@@ -518,8 +599,15 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
             }
             _ => {}
         }
-        let defs = vec![Var::Flag];
-        return (defs, uses);
+        return (vec![Var::Flag], uses);
+    }
+
+    // CHKINS mutates its first register to the boolean result of `value instanceof class`.
+    // It does not read or write the VM condition flag.
+    if op == vm::VM_CHKINS {
+        let dst = ops.get(0).copied().unwrap_or(0);
+        let class = ops.get(1).copied().unwrap_or(0);
+        return (def_r0(dst), vec![Var::Reg(dst), Var::Reg(class)]);
     }
 
     // Branch uses flag.
@@ -527,10 +615,10 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
         return (Vec::new(), vec![Var::Flag]);
     }
 
-    // SETF/SETNF: dst := true/false (does NOT define Flag)
+    // SETF/SETNF copy the condition flag (or its inverse) into a register.
     if op == vm::VM_SETF || op == vm::VM_SETNF {
         let dst = ops.get(0).copied().unwrap_or(0);
-        return (vec![Var::Reg(dst)], Vec::new());
+        return (def_r0(dst), vec![Var::Flag]);
     }
 
     // CONST: dst := data[*]
@@ -572,17 +660,29 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
         return (def_r0(dst), Vec::new());
     }
 
-    // SRV: set return value (uses r)
-    if op == vm::VM_SRV {
-        return (Vec::new(), vec![r(0)]);
+    // CHGTHIS: dest := dest incontextof src. This mutates the closure value in
+    // dest, so SSA must model both the old dest and src as inputs.
+    if op == vm::VM_CHGTHIS {
+        let dest = ops.get(0).copied().unwrap_or(0);
+        let src = ops.get(1).copied().unwrap_or(0);
+        return (def_r0(dest), vec![Var::Reg(dest), Var::Reg(src)]);
     }
 
-    // RET / JMP / NOP / REGMEMBER / DEBUGGER / EXTRY / ENTRY: no register effects here.
+    // SRV writes the VM function-result slot immediately.  RET consumes the
+    // current slot value.  Modelling this slot as an SSA variable is essential
+    // across branches, loops and ENTRY/EXTRY boundaries.
+    if op == vm::VM_SRV {
+        return (vec![Var::Result], vec![r(0)]);
+    }
+    if op == vm::VM_RET {
+        return (Vec::new(), vec![Var::Result]);
+    }
+
+    // JMP / NOP / REGMEMBER / DEBUGGER / EXTRY / ENTRY: no scalar register effects here.
     // VM_JMP carries a relative PC offset as its single operand, NOT a register.
     if matches!(
         op,
-        vm::VM_RET
-            | vm::VM_JMP
+        vm::VM_JMP
             | vm::VM_NOP
             | vm::VM_REGMEMBER
             | vm::VM_DEBUGGER
@@ -643,7 +743,7 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
     if op == vm::VM_DELD {
         let dst = ops.get(0).copied().unwrap_or(0);
         let obj = ops.get(1).copied().unwrap_or(0);
-        return (vec![Var::Reg(dst)], vec![Var::Reg(obj)]);
+        return (def_r0(dst), vec![Var::Reg(obj)]);
     }
 
     // DELI: dst := delete obj[key_reg]
@@ -651,7 +751,7 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
         let dst = ops.get(0).copied().unwrap_or(0);
         let obj = ops.get(1).copied().unwrap_or(0);
         let key = ops.get(2).copied().unwrap_or(0);
-        return (vec![Var::Reg(dst)], vec![Var::Reg(obj), Var::Reg(key)]);
+        return (def_r0(dst), vec![Var::Reg(obj), Var::Reg(key)]);
     }
 
     if op == vm::VM_TYPEOFD {
@@ -664,6 +764,19 @@ fn effects_of(op: i32, words: &[i32]) -> (Vec<Var>, Vec<Var>) {
         let base = ops.get(1).copied().unwrap_or(0);
         let key = ops.get(2).copied().unwrap_or(0);
         return (def_r0(dst), vec![Var::Reg(base), Var::Reg(key)]);
+    }
+
+    // EVAL replaces its operand register with the evaluation result, while EEXP
+    // executes the same postfix eval operator for side effects without replacing
+    // the source register. Model them explicitly so EEXP does not create a bogus
+    // SSA definition.
+    if op == vm::VM_EVAL {
+        let reg = ops.get(0).copied().unwrap_or(0);
+        return (def_r0(reg), vec![Var::Reg(reg)]);
+    }
+    if op == vm::VM_EEXP {
+        let reg = ops.get(0).copied().unwrap_or(0);
+        return (Vec::new(), vec![Var::Reg(reg)]);
     }
 
     // INC/DEC families
@@ -926,4 +1039,57 @@ fn effects_op1_prop(ops: &[i32], base: i32, op: i32, rmw: bool) -> (Vec<Var>, Ve
         }
         _ => (Vec::new(), Vec::new()),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effects_of, Var};
+    use crate::vmcodes::vm;
+
+    #[test]
+    fn setf_and_setnf_read_flag_and_define_register() {
+        for op in [vm::VM_SETF, vm::VM_SETNF] {
+            let (defs, uses) = effects_of(op, &[op, 5]);
+            assert_eq!(defs, vec![Var::Reg(5)]);
+            assert_eq!(uses, vec![Var::Flag]);
+        }
+    }
+
+    #[test]
+    fn eval_and_eexp_have_distinct_register_effects() {
+        let (defs, uses) = effects_of(vm::VM_EVAL, &[vm::VM_EVAL, 5]);
+        assert_eq!(defs, vec![Var::Reg(5)]);
+        assert_eq!(uses, vec![Var::Reg(5)]);
+
+        let (defs, uses) = effects_of(vm::VM_EEXP, &[vm::VM_EEXP, 5]);
+        assert!(defs.is_empty());
+        assert_eq!(uses, vec![Var::Reg(5)]);
+    }
+
+    #[test]
+    fn chkins_mutates_value_register_without_touching_flag() {
+        let (defs, uses) = effects_of(vm::VM_CHKINS, &[vm::VM_CHKINS, 3, 4]);
+        assert_eq!(defs, vec![Var::Reg(3)]);
+        assert_eq!(uses, vec![Var::Reg(3), Var::Reg(4)]);
+    }
+
+    #[test]
+    fn comparisons_define_flag() {
+        for op in [vm::VM_CEQ, vm::VM_CDEQ, vm::VM_CLT, vm::VM_CGT] {
+            let (defs, uses) = effects_of(op, &[op, 3, 4]);
+            assert_eq!(defs, vec![Var::Flag]);
+            assert_eq!(uses, vec![Var::Reg(3), Var::Reg(4)]);
+        }
+    }
+    #[test]
+    fn srv_and_ret_are_connected_through_result_slot() {
+        let (defs, uses) = effects_of(vm::VM_SRV, &[vm::VM_SRV, 7]);
+        assert_eq!(defs, vec![Var::Result]);
+        assert_eq!(uses, vec![Var::Reg(7)]);
+
+        let (defs, uses) = effects_of(vm::VM_RET, &[vm::VM_RET]);
+        assert!(defs.is_empty());
+        assert_eq!(uses, vec![Var::Result]);
+    }
+
 }

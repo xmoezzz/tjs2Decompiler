@@ -202,8 +202,8 @@ fn decode_call_size(code: &[i32], pc: usize) -> Result<usize> {
     // Mirror `disasm::format_call` size logic.
     // Layout:
     // CALL:  op, dst, func, argc, [args...]
-    // CALLD: op, dst, obj, member_data, func, argc, ...
-    // CALLI: op, dst, obj, member_reg,  func, argc, ...
+    // CALLD: op, dst, obj, member_data, argc, [args...]
+    // CALLI: op, dst, obj, member_reg,  argc, [args...]
     // NEW:   op, dst, func, argc, ...
     let op = code[pc];
     let header = match op {
@@ -237,4 +237,24 @@ fn ensure(code: &[i32], pc: usize, need: usize) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_one;
+    use crate::vmcodes::vm;
+
+    #[test]
+    fn ccl_is_three_words() {
+        let insn = decode_one(&[vm::VM_CCL, 2, 4], 0).expect("decode CCL");
+        assert_eq!(insn.size, 3);
+        assert_eq!(insn.operands(), &[2, 4]);
+    }
+
+    #[test]
+    fn branches_keep_relative_operand_in_decoder() {
+        let insn = decode_one(&[vm::VM_JF, -7], 0).expect("decode JF");
+        assert_eq!(insn.size, 2);
+        assert_eq!(insn.operands(), &[-7]);
+    }
 }
